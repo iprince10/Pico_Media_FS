@@ -2,7 +2,7 @@
 
 Pico Media FS is a bare-metal media browser and display project for the Raspberry Pi Pico (RP2040). It is being developed to read media from a FAT32 SD card and present it through an ILI9341 TFT display. The current code is a hardware bring-up and streaming prototype; the complete browser and media player are planned work.
 
-## Project goals
+## Project Features
 
 - Browse files and folders on a FAT32-formatted SD card.
 - Use physical push buttons to navigate media folders and select files.
