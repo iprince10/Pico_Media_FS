@@ -112,10 +112,6 @@ int main()
   spi1_init();
   sd_dummy_clocks();
   led_init();
-  ili9341_init();
-  // ili9341_fill_area(0, 0, 239, 319, 0xFFFF);
-  // ili9341_draw_char(2, 2, 'A', 0x0000, 0xFFFF, 2);
-  // ili9341_draw_string(4, 158, "PrinceJha%", 0x0000, 0xFFFF, 2);
 
   // SD: silent bring-up. if the card does not come up, run it again through
   // the talking version, so a failure is always visible and the debug cost
@@ -179,6 +175,10 @@ int main()
       uart0_puts("Root dir FAIL\r\n");
     }
     // blast the image with the real geometry
+    ili9341_init();
+    // ili9341_fill_area(0, 0, 239, 319, 0xFFFF);
+    // ili9341_draw_char(2, 2, 'A', 0x0000, 0xFFFF, 2);
+    // ili9341_draw_string(4, 158, "PrinceJha%", 0x0000, 0xFFFF, 2);
     draw_prince(&geom);
   }
   else

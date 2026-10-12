@@ -387,7 +387,7 @@ void sd_set_clk_fast(void)
 {
     SPI1_SSPCR1 &= ~(SPI1_SSPCR1_SSE); // stop the peripheral before changing clock
     SPI1_SSPCPSR = 2;                  // CPSDVSR should be (even) Clock pre scale divisor
-    SPI1_SSPCR0 = 0x0407;              // scr can be anything between 1-255 , serial clock rate 8 bit spi mode0
+    SPI1_SSPCR0 = 0x0407;              // scr can be anything between 0-255 , serial clock rate 8 bit spi mode0
     SPI1_SSPCR1 |= SPI1_SSPCR1_SSE;    // re-enable
     delay_ms(1);
 }
