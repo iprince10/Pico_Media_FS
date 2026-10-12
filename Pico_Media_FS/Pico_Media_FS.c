@@ -7,6 +7,12 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* ---- counters defined in sdcard.c / fat32.c ---- */
+extern uint64_t sd_time_us;
+extern uint32_t sd_read_count;
+extern uint64_t lcd_time_us;
+extern uint32_t lcd_bytes;
+
 #define IO_BANK0_BASE 0x40014000u
 
 #define GPIO_FUNC_SIO 5u
@@ -109,6 +115,7 @@ static void sd_bringup_debug(void)
 int main()
 {
   uart0_init();
+  uint64_t t_start = read_timer();
   spi1_init();
   sd_dummy_clocks();
   led_init();
@@ -179,7 +186,46 @@ int main()
     // ili9341_fill_area(0, 0, 239, 319, 0xFFFF);
     // ili9341_draw_char(2, 2, 'A', 0x0000, 0xFFFF, 2);
     // ili9341_draw_string(4, 158, "PrinceJha%", 0x0000, 0xFFFF, 2);
+    // draw_prince(&geom);
+
+    /* ---- STEP 1: timed frame ---- */
+    sd_time_us = 0;
+    sd_read_count = 0;
+    lcd_time_us = 0;
+    lcd_bytes = 0;
+
+    uint64_t t0 = read_timer();
     draw_prince(&geom);
+    uint64_t wall = read_timer() - t0;
+
+    uint32_t sd_us = (uint32_t)sd_time_us;
+    uint32_t lcd_us = (uint32_t)lcd_time_us;
+
+    uart0_puts("\r\n==== FRAME TIMING ====\r\n");
+    uart0_puts("SD  : ");
+    uart0_putnum(sd_us / 1000);
+    uart0_puts(" ms  (");
+    uart0_putnum(sd_us % 1000);
+    uart0_puts(" us)  ");
+    uart0_putnum(sd_read_count);
+    uart0_puts(" block reads\r\n");
+    uart0_puts("LCD : ");
+    uart0_putnum(lcd_us / 1000);
+    uart0_puts(" ms  (");
+    uart0_putnum(lcd_us % 1000);
+    uart0_puts(" us)  ");
+    uart0_putnum(lcd_bytes);
+    uart0_puts(" bytes\r\n");
+    uart0_puts("TOTAL draw_prince : ");
+    uart0_putnum((uint32_t)(wall / 1000));
+    uart0_puts(" ms\r\n");
+    uart0_puts("UART/other (total - SD - LCD) : ");
+    uart0_putnum((uint32_t)((wall - sd_us - lcd_us) / 1000));
+    uart0_puts(" ms\r\n");
+    uart0_puts("boot to first pixel : ");
+    uart0_putnum((uint32_t)((read_timer() - t_start) / 1000));
+    uart0_puts(" ms\r\n");
+    uart0_puts("======================\r\n");
   }
   else
   {

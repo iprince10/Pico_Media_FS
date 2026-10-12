@@ -101,7 +101,7 @@ void ili9341_init(void)
     SIO_GPIO_OUT_SET = (1u << 21);             // rst high
     SIO_GPIO_OUT_CLEAR = (1u << 20);           // clear d/c pin
 
-    spi0_init(); // spi0 initialise
+    spi0_init(); // spi0 initialise the bus first
 
     ili9341_hw_reset(); // hardware reset using hardware pin 21
 
@@ -123,7 +123,7 @@ void spi0_init(void)
     SPI0_SSPCPSR = 2;              // this is for spio clock register , it can only be an even value between 2-255
     SPI0_SSPCR0 = 0x0007;          // control register of spi0 , the 8-12 bits are the clock divisor inside control register 0
     SPI0_SSPCR1 = SPI0_SSPCR1_SSE; // synchronous serial port enable
-    delay_ms(100);
+    // delay_ms(100);
 }
 
 void ili9341_hw_reset()
@@ -145,7 +145,7 @@ void spi_write_byte(uint8_t byte)
     {
     }
     volatile uint32_t dummy = SPI0_SSPDR;
-    (void)dummy;
+    (void)dummy;  // discard the return byte 
 }
 
 void ili9341_write_command(uint8_t cmd)
@@ -172,7 +172,7 @@ void ili9341_send_init_commands(void)
     ili9341_write_data(0x48);
 
     ili9341_write_command(0x29); // turn display on
-    delay_ms(100);
+    // delay_ms(100);
 }
 
 void ili9341_fill_white(void)

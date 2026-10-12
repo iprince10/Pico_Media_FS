@@ -5,6 +5,10 @@
 #include "fat32.h"
 #include "ili9341.h"
 
+/* ---- instrumentation: LCD-side timing ---- */
+uint64_t lcd_time_us = 0; /* total time inside the pixel push loop */
+uint32_t lcd_bytes = 0;   /* bytes pushed at the panel             */
+
 // little endian: lowest offset holds the least significant byte. this is the
 // reverse of what sd_send_command puts on the wire
 static uint32_t mbr_read_le32(const uint8_t *b)
@@ -903,6 +907,7 @@ static void lcd_sink(const uint8_t *buf, uint32_t len, void *ctx) // parameters 
 {
     disp_ctx_t *p = (disp_ctx_t *)(ctx); // restore the pointer type as ctx was passed as a generic pointer type, thus it need to be cast to reattach the type to the raw address to dereference the struct and copy that pointer's value into p
     // a pixel is 2 bytes , step i by 2 so a pair is never split
+    uint64_t t0 = read_timer();
     for (uint32_t i = 0; i + 1 < len; i += 2)
     {
         // the file stores each pixel HIGH byte first ( the pillow script wrote
@@ -911,6 +916,8 @@ static void lcd_sink(const uint8_t *buf, uint32_t len, void *ctx) // parameters 
         ili9341_write_data(buf[i]);     // high byte (first in file)
         ili9341_write_data(buf[i + 1]); // low byte
     }
+    lcd_time_us += (read_timer() - t0);
+    lcd_bytes += len;
     p->bytes += len;
 }
 

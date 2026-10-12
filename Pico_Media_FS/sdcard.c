@@ -3,6 +3,10 @@
 #include "uart.h"
 #include "sdcard.h"
 
+/* ----  instrumentation: SD-side timing ---- */
+uint64_t sd_time_us = 0;    /* total time inside sd_read_block   */
+uint32_t sd_read_count = 0; /* how many block reads happened     */
+
 #define SIO_BASE 0xd0000000u
 #define SIO_GPIO_OE (*(volatile uint32_t *)(SIO_BASE + 0x020))
 #define SIO_GPIO_OE_SET (*(volatile uint32_t *)(SIO_BASE + 0x024))
@@ -58,16 +62,20 @@ void spi1_init(void)
     GPIO12_CTRL = GPIO_FUNC_SPI1; // rx miso
 
     CLK_PERI_CTRL |= CLK_PERI_CTRL_ENABLE; // enable clock , by default clock is gated for the spi1 peripheral
-    RESETS_RESET &= ~(RESETS_RESET_SPI1);  // do a software reset and wait for reset done signal
+    RESETS_RESET &= ~(RESETS_RESET_SPI1);  // do a software reset and wait for reset done signa l
     while (!(RESETS_RESET_DONE & RESETS_RESET_SPI1))
     {
         // wait
     };
 
+    // SPI CLK  = SCLK / CPSDVSR * (1 + SCR)
+    // e.g. : 54 * (1 + 5) = 324  ->  ~ 386 KHz slow spi clock in init we will make it faster later
+    // SSE must be cleared before touching SSPCR0 / SSPCPSR
+
     SPI1_SSPCPSR = 54;             // this is for spio clock register 386KHz for init slower pulse at the start
     SPI1_SSPCR0 = 0x0507;          // control register of spi0 , the 5 is the clock divisor inside control register 0
     SPI1_SSPCR1 = SPI1_SSPCR1_SSE; // synchronous serial port enable
-    delay_ms(100);
+    // delay_ms(100);
 
     // remember to make cs of spi1 as gpio cause we need to manually make it low all the time
     // cs init as plain sio
@@ -187,7 +195,6 @@ void sd_dummy_clocks(void) // dummy clocks at startup
  * from CMD7/12/38), R2 (CMD13), the data-response token 0x05 from CMD24, and
  * the 0xFD stop-tran token from CMD25.
  */
-
 
 // sending command , commands consists of 6 bytes:-
 // first byte is start bit + cmd number
@@ -320,7 +327,7 @@ uint8_t sd_acmd41(void)
             return 0xFF;
         }
 
-        sd_send_command(41, SD_ACMD41_ARG, SD_DUMMY_CRC);  //acmd41 , argument field then dummy crc, the 4 in argument field says: "I understand high-capacity cards, and I'm not narrowing the voltage window."
+        sd_send_command(41, SD_ACMD41_ARG, SD_DUMMY_CRC); // acmd41 , argument field then dummy crc, the 4 in argument field says: "I understand high-capacity cards, and I'm not narrowing the voltage window."
         r1 = sd_read_r1();
         cs_deselect();       // cs high
         spi1_transfer(0xFF); // to register the cs high and clear out any trailing
@@ -399,12 +406,12 @@ void sd_set_clk_fast(void)
 // then 2 CRC16 bytes (discarded). CS stays low across the whole thing.
 // On SDHC the argument is a plain block index (CCS=1 from CMD58).
 // buf must hold at least 512 bytes. returns 0 on success, 0xFF on failure.
-uint8_t sd_read_block(uint32_t block, uint8_t *buf)
+static uint8_t sd_read_block_raw(uint32_t block, uint8_t *buf)
 {
     uint8_t r1, token;
-    cs_select(); // cs must stay low for whole exchange here
+    cs_select();                              // cs must stay low for whole exchange here
     sd_send_command(17, block, SD_DUMMY_CRC); // cmd number 17, block number , dont care or dummy crc
-    r1 = sd_read_r1();  // poll the miso with timeout , get an 0x00 it is a valid start marker
+    r1 = sd_read_r1();                        // poll the miso with timeout , get an 0x00 it is a valid start marker
     if (r1 != 0x00)
     {
         cs_deselect();
@@ -443,8 +450,17 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
     return 0;
 }
 
+uint8_t sd_read_block(uint32_t block, uint8_t *buf)
+{
+    uint64_t t0 = read_timer();
+    uint8_t rc = sd_read_block_raw(block, buf);
+    sd_time_us += (read_timer() - t0);
+    sd_read_count++;
+    return rc;
+}
+
 // read each block twice and compare all the 512 bytes
-uint8_t sd_integrity_test(uint32_t first, int count)  // first is block number passed and count is 300
+uint8_t sd_integrity_test(uint32_t first, int count) // first is block number passed and count is 300
 {
     static uint8_t blkA[SD_BLOCK_SIZE]; // first read of block
     static uint8_t blkB[SD_BLOCK_SIZE]; // second read of block
@@ -504,7 +520,6 @@ uint8_t sd_integrity_test(uint32_t first, int count)  // first is block number p
     }
     return 0xFF;
 }
-
 
 /*---- Opened the serial port COM14 ----
 CMD0....
