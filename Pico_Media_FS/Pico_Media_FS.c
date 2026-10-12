@@ -1,0 +1,194 @@
+#include "bitmap.h"
+#include "fat32.h"
+#include "ili9341.h"
+#include "sdcard.h"
+#include "timer.h"
+#include "uart.h"
+#include <stdint.h>
+#include <stdio.h>
+
+#define IO_BANK0_BASE 0x40014000u
+
+#define GPIO_FUNC_SIO 5u
+#define GPIO25_CTRL (*(volatile uint32_t *)(IO_BANK0_BASE + 0xcc))
+#define SIO_BASE 0xd0000000u
+#define SIO_GPIO_OE (*(volatile uint32_t *)(SIO_BASE + 0x020))
+#define SIO_GPIO_OUT (*(volatile uint32_t *)(SIO_BASE + 0x010))
+#define SIO_GPIO_OUT_XOR (*(volatile uint32_t *)(SIO_BASE + 0x01c))
+#define GPIO25 (1u << 25)
+
+void led_init(void)
+{
+  // blink code just for testing
+  GPIO25_CTRL = GPIO_FUNC_SIO;
+  SIO_GPIO_OE |= GPIO25;
+  SIO_GPIO_OUT |= GPIO25;
+}
+
+/* ---- SD bring-up ----
+   the protocol lives in exactly one place: sd_bringup().
+   sd_bringup_debug() is a wrapper that runs it and narrates the result,
+   so debug output is optional and never duplicated. */
+
+typedef struct
+{
+  int cmd0;      // 1 = idle ok
+  uint8_t cmd8;  // 1 = v2 echoed, 2 = v1 (old), 0 = fail
+  int acmd41;    // 0 = ready
+  uint8_t cmd58; // 1 = SDHC block addressing, 2 = SDSC byte, 0 = fail
+} sd_status_t;
+
+// talks to the card - no uart. leaves the card initialised and on the fast
+// clock, ready for block reads. returns 0, or the negative step number that
+// failed (so the caller can report which stage died).
+static int sd_bringup(sd_status_t *st)
+{
+  st->cmd0 = sd_cmd0();
+  if (!st->cmd0)
+    return -1;
+
+  st->cmd8 = sd_cmd8();
+  if (st->cmd8 == 0)
+    return -2;
+
+  st->acmd41 = sd_acmd41();
+  if (st->acmd41 != 0)
+    return -3;
+
+  st->cmd58 = sd_cmd58();
+  if (st->cmd58 == 0)
+    return -4;
+
+  sd_set_clk_fast(); // last: only now is the card allowed full speed
+  return 0;
+}
+
+// runs the bring-up and prints every step, in the same words as before.
+static void sd_bringup_debug(void)
+{
+  sd_status_t st = {0};
+
+  int rc = sd_bringup(&st);
+
+  uart0_puts("---- SD bring-up ----\r\n");
+
+  uart0_puts("CMD0....\r\n");
+  uart0_puts(st.cmd0 ? "CMD0 Ok - card in idle\r\n" : "CMD0 FAIL\r\n");
+
+  uart0_puts("CMD8....\r\n");
+  if (st.cmd8 == 1)
+    uart0_puts("CMD8 Ok - modern card, token echoed\r\n");
+  else if (st.cmd8 == 2)
+    uart0_puts("CMD8 - V1 card (old)\r\n");
+  else
+    uart0_puts("CMD8 FAIL\r\n");
+
+  uart0_puts("CMD55 + ACMD41....\r\n");
+  uart0_puts(st.acmd41 == 0 ? "ACMD41 Ok - card ready\r\n" : "ACMD41 FAIL\r\n");
+
+  uart0_puts("CMD58....\r\n");
+  if (st.cmd58 == 1)
+    uart0_puts("CMD58 Ok - block addressing (SDHC/SDXC)\r\n");
+  else if (st.cmd58 == 2)
+    uart0_puts("CMD58 - byte addressing (SDSC)\r\n");
+  else
+    uart0_puts("CMD58 FAIL\r\n");
+
+  if (rc == 0)
+  {
+    uart0_puts("SPI1 CLK is 12.5 MHz now\r\n");
+  }
+  else
+  {
+    uart0_puts("bring-up stopped at step ");
+    uart0_putnum((uint32_t)(-rc));
+    uart0_puts("\r\n");
+  }
+}
+
+int main()
+{
+  uart0_init();
+  spi1_init();
+  sd_dummy_clocks();
+  led_init();
+  ili9341_init();
+  // ili9341_fill_area(0, 0, 239, 319, 0xFFFF);
+  // ili9341_draw_char(2, 2, 'A', 0x0000, 0xFFFF, 2);
+  // ili9341_draw_string(4, 158, "PrinceJha%", 0x0000, 0xFFFF, 2);
+
+  // SD: silent bring-up. if the card does not come up, run it again through
+  // the talking version, so a failure is always visible and the debug cost
+  // is only ever paid on failure.
+  sd_status_t st;
+  if (sd_bringup(&st) != 0)
+  {
+    sd_bringup_debug();
+  }
+
+  // sd_bringup_debug();     // <- uncomment this line while bringing the board up
+
+  // MBR Parser block 0 is the partition table. the start LBA it hands back is already a block number,
+  static uint8_t mbr[512];
+  uint32_t part_start = 0;
+  uint32_t part_size = 0;
+
+  uart0_puts("MBR - reading block 0....\r\n");
+  if (sd_read_block(0, mbr) != 0)
+  {
+    uart0_puts("MBR FAIL - could not read block 0\r\n");
+  }
+  else if (sd_mbr_parse(mbr, &part_start, &part_size) == 0)
+  {
+    uart0_puts("MBR Ok - filesystem starts at block ");
+    uart0_putnum(part_start);
+    uart0_puts("\r\n");
+    uart0_puts("\r\n");
+  }
+  else
+  {
+    uart0_puts("MBR FAIL - no usable partition table\r\n");
+  }
+
+  // BPB block part_start is the VBR. its BPB gives the FAT32 geometry, which
+  // every later read depends on. no point going on if this fails.
+  static uint8_t vbr[512]; // static 512 byte block for volume boot record
+  fat_geom_t geom;         // struct to store the main fields of the vbr/bios
+
+  uart0_puts("BPB - reading block ");
+  uart0_putnum(part_start);
+  uart0_puts("....\r\n");
+  if (sd_read_block(part_start, vbr) != 0)
+  {
+    uart0_puts("BPB FAIL - could not read the VBR\r\n");
+  }
+  else if (fat32_parse_bpb(vbr, part_start, &geom) == 0)
+  {
+    uart0_puts("BPB Ok - FAT32 geometry read\r\n");
+    uart0_puts("\r\n");
+
+    uart0_puts("Root dir - listing....\r\n");
+    if (fat32_list_root(&geom) == 0)
+    {
+      uart0_puts("Root dir Ok\r\n");
+      uart0_puts("\r\n");
+      // read_prince(&geom); // only ever called with valid geometry
+    }
+    else
+    {
+      uart0_puts("Root dir FAIL\r\n");
+    }
+    // blast the image with the real geometry
+    draw_prince(&geom);
+  }
+  else
+  {
+    uart0_puts("BPB FAIL - not a usable FAT32 boot sector\r\n");
+  }
+
+  while (1)
+  {
+    SIO_GPIO_OUT_XOR = GPIO25;
+    delay_ms(500);
+  }
+}

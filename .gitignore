@@ -1,0 +1,26 @@
+# Build directories anywhere in the repository
+build/
+cmake-build-*/
+
+# VS Code settings anywhere in the repository
+.vscode/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+Makefile
+
+# Compiled/generated firmware
+*.o
+*.elf
+*.map
+*.bin
+*.hex
+*.uf2
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

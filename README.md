@@ -1,0 +1,1 @@
+Bare-metal SD card media explorer for RP2040: FAT32 driver, ILI9341 file browser UI, and JPG/PNG image viewer, with MP3 and video planned.
