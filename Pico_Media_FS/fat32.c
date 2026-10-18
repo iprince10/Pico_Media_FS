@@ -777,56 +777,77 @@ fat32_sink_t is a name for any function that takes (block pointer, length, lengt
 */
 typedef void (*fat32_sink_t)(const uint8_t *buf, uint32_t len, void *ctx);
 
-/* read a file and hand its bytes, block by block, to 'sink'
-start is the first cluster from the directory entry, size is its exact byte count, the chain is followed through the FAT until size byte have
-come out, which is what ends the read, not the chain marker.
-returns 0 success, 0xFF if a block read failed or the chain ran out
-before size bytes were produced (a truncated or corrupt file).
+/* Adapter that let's a whole CMD 18 cluster run feed the caller's sink/
+   fat32_read_file knows the file's exact size, the block reader does not.
+   This wraps the caller's sink and trims the final partial block, so the
+   sink contract(never see more bytes than the file owns) is preserved.
 */
-uint8_t fat32_read_file(const fat_geom_t *g, uint32_t start, uint32_t size, fat32_sink_t sink, void *ctx) // the g is the geometry struct passed with the bpb info, start is the first cluster being passed, size is the total bytes, // sink is function pointer to the callback function that processes each file-data block, // ctx is generic pointer to caller-provided context/state passed to the callback
+typedef struct
 {
-    static uint8_t file_buf[512]; // one block for all reads , same a dir_buf
-    static uint8_t fat_buf[512];  // scratch buffer for FAT read slots
-    uint32_t clus = start;        // passed cluster as the start
-    uint32_t emitted = 0;         // bytes handed to the sink so far
+    fat32_sink_t user_sink; // the caller's consumer (lcd sink or probe sink)
+    void *user_ctx;         // its context
+    uint32_t remaining;     // file bytes still owed
+} trim_ctx_t;
+
+static void trim_sink(const uint8_t *buf, uint32_t len, void *ctx) // function to call the sink each time with one block of bytes read
+{
+    // restore the pointer type as ctx was passed as a generic pointer type, thus it need to be cast to reattach the type to the raw address to dereference the struct and copy that pointer's value into t
+    trim_ctx_t *t = (trim_ctx_t *)ctx;
+    uint32_t chunk = (t->remaining < len) ? t->remaining : len; // pass the len when remaining bytes file still owes is >= 512 , pass the remaining when <512
+    t->user_sink(buf, chunk, t->user_ctx);                      // calls the lcd sink passes the buffer, chunk and the user context attached
+    t->remaining -= chunk;
+}
+
+// new read file block , it's cluster → one CMD18 → sink ×N. The FAT is consulted once per cluster, exactly as before — just 5 times instead of 300. it used to be it used to be nested cluster → sector → sink , the function commented pasted below
+
+uint8_t fat32_read_file(const fat_geom_t *g, uint32_t start, uint32_t size, fat32_sink_t sink, void *ctx) // the sink passed here is lcd sink although it could be probe sink as well
+{
+    static uint8_t fat_buf[512]; // scratch for FAT slot reads
+    uint32_t clus = start;       // cluster we are reading now
 
     if (size == 0)
     {
-        return 0; // empty file nothing to read
+        return 0; // empty file - nothing to read
     }
     if (start < 2)
     {
-        return 0xFF; // no valid first cluster entry is broken
+        return 0xFF; // no valid first cluster - entry is broken
     }
 
-    while (1)
+    trim_ctx_t t;       // making own context struct here
+    t.user_sink = sink; // the passed lcd sink function
+    t.user_ctx = ctx;   // total bytes or whatever the context passed
+    t.remaining = size; // total byte remaining decremented each run
+
+    while (t.remaining > 0) // loop runs till the total bytes becomes 0
     {
-        // a cluster is 64 sectors/blocks per cluster, walked in order
-        for (uint32_t s = 0; s < g->sectors_per_cluster; s++)
+        uint32_t first_block = fat32_cluster_to_block(g, clus); // where this cluster's data starts on the card
+
+        /* how many blocks of this cluster the file still needs. the last
+           cluster is normally short, so this is usually less than
+           sectors_per_cluster - CMD18 is asked for exactly that many and
+           never reads past the end of the file */
+        uint32_t blocks_owed = (t.remaining + 511u) / 512u;                                                   // for starters it is 300 then decrements by 64 cause total sectors per clusters is 64
+        uint32_t blocks_this = (blocks_owed < g->sectors_per_cluster) ? blocks_owed : g->sectors_per_cluster; // block_this is passed as count in sdreadmultiblock cmd18 , either 64 or whatever <64 the file owes
+
+        // one CMD18 for the whole run, instead of one CMD17 per block
+        if (sd_read_multi_block(first_block, blocks_this, trim_sink, &t) != 0) // first block is passed , block_this as total count as multi read command reads max 64 blocks in one run then comes back for next cluster number done below, trim sink with ctx is passed which further calls lcd sink to dump the read and return with remaining decremented
         {
-            uint32_t blk = fat32_cluster_to_block(g, clus) + s; // block in the cluster to read in this iteration
-            if (sd_read_block(blk, file_buf) != 0)
-            {
-                uart0_puts("FILE: read failed at block ");
-                uart0_putnum(blk);
-                uart0_puts("\r\n");
-                return 0xFF;
-            }
-            // only the bytes up to the size belong to the file ; the final cluster can carry slack that must not be emitted
-            uint32_t remain = size - emitted;               // stores the remaining bytes after each
-            uint32_t chunk = (remain < 512) ? remain : 512; // chunk is the no. of bytes that is passed to the read function , this is condition is because of the final slack it may or may not be less than 512 bytes therefore to cut the slack this is done
-            sink(file_buf, chunk, ctx);                     // sink is a function pointer to the callback function, chunk is the no of bytes passed, ctx is whatever the value needed to be passed in this case a struct containing two state variables
-            emitted += chunk;                               // updated the emitted bytes
-            if (emitted >= size)
-            {
-                return 0; // every byte is out done
-            }
+            uart0_puts("FILE: multi-read failed at block ");
+            uart0_putnum(first_block);
+            uart0_puts("\r\n");
+            return 0xFF;
         }
-        // the cluster is used up and we still owe bytes , so the file
-        // continues in the next cluster of the chain, ask the fat
+
+        // remaining is decremented after every run by chunks i.e. 512 in trim sink which also dumps the chunk to the lcd sink as well
+
+        if (t.remaining == 0)
+        {
+            return 0; // every byte is out - done
+        }
+
+        // cluster used up and bytes still owed: the file continues in the next cluster of the chain, ask the FAT
         uint32_t next = fat32_next_cluster(g, clus, fat_buf) & 0x0FFFFFFFu;
-        // 0x0FFFFFF7 is bad , 0x0FFFFFF8..F is the end of the chain, below 2 is free
-        //  or reserved : none of these can be a next cluster
         if (next < 2 || next >= 0x0FFFFFF7u)
         {
             uart0_puts("FILE: chain ended before size bytes\r\n");
@@ -834,7 +855,67 @@ uint8_t fat32_read_file(const fat_geom_t *g, uint32_t start, uint32_t size, fat3
         }
         clus = next;
     }
+    return 0;
 }
+
+/* read a file and hand its bytes, block by block, to 'sink'
+start is the first cluster from the directory entry, size is its exact byte count, the chain is followed through the FAT until size byte have
+come out, which is what ends the read, not the chain marker.
+returns 0 success, 0xFF if a block read failed or the chain ran out
+before size bytes were produced (a truncated or corrupt file).
+*/
+// uint8_t fat32_read_file(const fat_geom_t *g, uint32_t start, uint32_t size, fat32_sink_t sink, void *ctx) // the g is the geometry struct passed with the bpb info, start is the first cluster being passed, size is the total bytes, // sink is function pointer to the callback function that processes each file-data block, // ctx is generic pointer to caller-provided context/state passed to the callback
+// {
+//     static uint8_t file_buf[512]; // one block for all reads , same a dir_buf
+//     static uint8_t fat_buf[512];  // scratch buffer for FAT read slots
+//     uint32_t clus = start;        // passed cluster as the start
+//     uint32_t emitted = 0;         // bytes handed to the sink so far
+
+//     if (size == 0)
+//     {
+//         return 0; // empty file nothing to read
+//     }
+//     if (start < 2)
+//     {
+//         return 0xFF; // no valid first cluster entry is broken
+//     }
+
+//     while (1)
+//     {
+//         // a cluster is 64 sectors/blocks per cluster, walked in order
+//         for (uint32_t s = 0; s < g->sectors_per_cluster; s++)
+//         {
+//             uint32_t blk = fat32_cluster_to_block(g, clus) + s; // block in the cluster to read in this iteration
+//             if (sd_read_block(blk, file_buf) != 0)
+//             {
+//                 uart0_puts("FILE: read failed at block ");
+//                 uart0_putnum(blk);
+//                 uart0_puts("\r\n");
+//                 return 0xFF;
+//             }
+//             // only the bytes up to the size belong to the file ; the final cluster can carry slack that must not be emitted
+//             uint32_t remain = size - emitted;               // stores the remaining bytes after each
+//             uint32_t chunk = (remain < 512) ? remain : 512; // chunk is the no. of bytes that is passed to the read function , this is condition is because of the final slack it may or may not be less than 512 bytes therefore to cut the slack this is done
+//             sink(file_buf, chunk, ctx);                     // sink is a function pointer to the callback function, chunk is the no of bytes passed, ctx is whatever the value needed to be passed in this case a struct containing two state variables
+//             emitted += chunk;                               // updated the emitted bytes
+//             if (emitted >= size)
+//             {
+//                 return 0; // every byte is out done
+//             }
+//         }
+//         // the cluster is used up and we still owe bytes , so the file
+//         // continues in the next cluster of the chain, ask the fat
+//         uint32_t next = fat32_next_cluster(g, clus, fat_buf) & 0x0FFFFFFFu;
+//         // 0x0FFFFFF7 is bad , 0x0FFFFFF8..F is the end of the chain, below 2 is free
+//         //  or reserved : none of these can be a next cluster
+//         if (next < 2 || next >= 0x0FFFFFF7u)
+//         {
+//             uart0_puts("FILE: chain ended before size bytes\r\n");
+//             return 0xFF;
+//         }
+//         clus = next;
+//     }
+// }
 
 // print one byte as two hex digits
 // validation sink: shows the first 16 bytes of the file in hex, then just
@@ -907,7 +988,7 @@ static void lcd_sink(const uint8_t *buf, uint32_t len, void *ctx) // parameters 
 {
     disp_ctx_t *p = (disp_ctx_t *)(ctx); // restore the pointer type as ctx was passed as a generic pointer type, thus it need to be cast to reattach the type to the raw address to dereference the struct and copy that pointer's value into p
     // a pixel is 2 bytes , step i by 2 so a pair is never split
-    uint64_t t0 = read_timer();
+    uint64_t t0 = read_timer(); // read the timer at the start
     for (uint32_t i = 0; i + 1 < len; i += 2)
     {
         // the file stores each pixel HIGH byte first ( the pillow script wrote
@@ -916,9 +997,9 @@ static void lcd_sink(const uint8_t *buf, uint32_t len, void *ctx) // parameters 
         ili9341_write_data(buf[i]);     // high byte (first in file)
         ili9341_write_data(buf[i + 1]); // low byte
     }
-    lcd_time_us += (read_timer() - t0);
-    lcd_bytes += len;
-    p->bytes += len;
+    lcd_time_us += (read_timer() - t0); // update the timer after one block passed
+    lcd_bytes += len;                   // updates bytes
+    p->bytes += len;                    // update bytes
 }
 
 // draw Prince.rgb full screen. g is the geometry parsed in main - borrowed,never rebuilt here.
