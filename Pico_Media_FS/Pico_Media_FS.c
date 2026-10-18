@@ -1,11 +1,11 @@
+#include <stdint.h>
+#include <stdio.h>
 #include "bitmap.h"
 #include "fat32.h"
 #include "ili9341.h"
 #include "sdcard.h"
 #include "timer.h"
 #include "uart.h"
-#include <stdint.h>
-#include <stdio.h>
 
 /* ---- counters defined in sdcard.c / fat32.c ---- */
 extern uint64_t sd_time_us;
@@ -201,7 +201,7 @@ int main()
     uint32_t sd_us = (uint32_t)sd_time_us;
     uint32_t lcd_us = (uint32_t)lcd_time_us;
 
-    uart0_puts("\r\n==== FRAME TIMING ====\r\n");
+    uart0_puts("\r\nFRAME TIMING\r\n");
     uart0_puts("SD  : ");
     uart0_putnum(sd_us / 1000);
     uart0_puts(" ms  (");
@@ -225,7 +225,7 @@ int main()
     uart0_puts("boot to first pixel : ");
     uart0_putnum((uint32_t)((read_timer() - t_start) / 1000));
     uart0_puts(" ms\r\n");
-    uart0_puts("======================\r\n");
+    uart0_puts("\r\n");
   }
   else
   {
@@ -238,3 +238,70 @@ int main()
     delay_ms(500);
   }
 }
+
+//before
+/*
+MBR - reading block 0....
+Part 0: Type 0x0C  FAT32 (LBA)
+Start : 2048 Size : 62531584 Sectors / 30533 MiB
+Chosen partition: Start block 2048 (size 30533 MiB)
+FAT32 confirmed - its VBR is the sector above
+MBR Ok - filesystem starts at block 2048
+
+BPB - reading block 2048....
+BPB: bytes/sector 512, Sectors/cluster 128 (65536 byte per clusters)
+Reserved 558, FATs 2, Sectors/FAT 3817
+Total sectors 62531584 (30533 MebiByte)
+FAT starts at block 2606, data starts at block 10240
+Clusters 488464, Root cluster 2
+BPB Ok - FAT32 geometry read
+
+Root dir - listing....
+Root dir: cluster 2, first block 10240
+[FILE] Prince.rgb  cluster 6  size 153600
+Root dir done, 1 root entries
+Root dir Ok
+
+LCD: streaming Prince.rgb...
+LCD: frame done, 153600 pixel-bytes
+
+FRAME TIMING
+SD  : 231 ms  (810 us)  302 block reads
+LCD : 88 ms  (572 us)  153600 bytes
+TOTAL draw_prince : 321 ms
+UART/other (total - SD - LCD) : 0 ms
+boot to first pixel : 951 ms
+*/
+
+//after
+/*
+MBR - reading block 0....
+Part 0: Type 0x0C  FAT32 (LBA)
+Start : 2048 Size : 62531584 Sectors / 30533 MiB
+Chosen partition: Start block 2048 (size 30533 MiB)
+FAT32 confirmed - its VBR is the sector above
+MBR Ok - filesystem starts at block 2048
+
+BPB - reading block 2048....
+BPB: bytes/sector 512, Sectors/cluster 128 (65536 byte per clusters)
+Reserved 558, FATs 2, Sectors/FAT 3817
+Total sectors 62531584 (30533 MebiByte)
+FAT starts at block 2606, data starts at block 10240
+Clusters 488464, Root cluster 2
+BPB Ok - FAT32 geometry read
+
+Root dir - listing....
+Root dir: cluster 2, first block 10240
+[FILE] Prince.rgb  cluster 6  size 153600
+Root dir done, 1 root entries
+Root dir Ok
+
+LCD: streaming Prince.rgb...
+LCD: frame done, 153600 pixel-bytes
+
+FRAME TIMING
+SD  : 141 ms  (729 us)  302 block reads
+LCD : 88 ms  (564 us)  153600 bytes
+TOTAL draw_prince : 231 ms
+UART/other (total - SD - LCD) : 0 ms
+boot to first pixel : 861 ms */
