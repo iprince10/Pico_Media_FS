@@ -124,6 +124,23 @@ void sd_dummy_clocks(void) // dummy clocks at startup
  * SD RESPONSES IN SPI MODE  --  only the types sdcard.c uses
  * (SD Physical Layer Simplified Spec Part 1, §7.3; Tables 7-2, 7-4, 7-5)
  *
+ * COMMAND RESPONSES
+ *   R1  — 1 byte. 0x00 = success; anything else is a packed error, so test
+ *         against 0x00, not against a nonzero mask. Bits: 0 idle, 1 erase
+ *         reset, 2 illegal command, 3 CRC error, 4 erase sequence error,
+ *         5 address error, 6 parameter error. Bit 7 is always 0.
+ *   R1b — R1 followed by one busy byte; wait for it to go nonzero.
+ *   R3  — R1 + 4 bytes OCR (used by ACMD41).
+ *   R7  — R1 + 4 bytes echoed command / voltage (used by CMD8).
+ *   R2  — two bytes, sent without CS high between the pair.
+ *  DATA TOKENS (read path)
+ *   0xFE = start of data block, 0xFD = card stopped the stream,
+ *   0x0X with bit 0 clear = data error. Anything else = not a token yet.
+ *
+ * RULE OF THUMB: on any failed R1, deselect, give the card one trailing
+ * 0xFF clock (and let it finish its busy period), then return. A bad
+ * argument byte misaligns every later byte in the transaction.
+ *
  * There is no unsolicited reply on SPI: the card only talks while we clock
  * bytes out, and MISO floats high while it is silent. So every response read
  * is "keep sending 0xFF and look at what comes back". A read of 0xFF means
@@ -189,7 +206,7 @@ void sd_dummy_clocks(void) // dummy clocks at startup
  *   CMD55 APP_CMD             R1   gateway; must precede every ACMD*
  *   ACMD41 SD_SEND_OP_COND    R1   poll until bit 0 clears -> 0x00
  *   CMD58 READ_OCR            R3   gives CCS -> SDHC vs SDSC
- *   CMD17 READ_SINGLE_BLOCK   R1, then token + 512 B + CRC16
+ *   CMD17 READ_SINGLE_BLOCK   R1,  then token + 512 B + CRC16
  *
  * Not used in this file (so not documented here): R1b (busy-waiting replies
  * from CMD7/12/38), R2 (CMD13), the data-response token 0x05 from CMD24, and
@@ -197,12 +214,12 @@ void sd_dummy_clocks(void) // dummy clocks at startup
  */
 
 // sending command , commands consists of 6 bytes:-
-// first byte is start bit + cmd number
+// first byte is start bit + cmd number in which the msb byte 7 is 0 ( start bit), then bit 6 is 1 (transmission bit) then followed by low 6 bits which contains the cmd number
 // next four bytes are argument bytes send in little endian , MSB first in lowest address
 // sixth byte is 7 bit CRC + 1 bit of 1 at the end as a end marker
 void sd_send_command(uint8_t cmd, uint32_t arg, uint8_t crc)
 {
-    spi1_transfer(0x40 | cmd);         // start bit(0) + cmd number as 4 here so the 4 is 0100
+    spi1_transfer(0x40 | cmd);         // the 0x40 is 0100 0000 gives the msb 7th bit as 0 (start bit) then 6th bit as 1 (transmission bit), then or with cmd number in the low 6 bits
     spi1_transfer((arg >> 24) & 0xFF); // MSB First big endian format
     spi1_transfer((arg >> 16) & 0xFF);
     spi1_transfer((arg >> 8) & 0xFF);
@@ -400,6 +417,7 @@ void sd_set_clk_fast(void)
 }
 
 #define SD_TOKEN_START_BLOCK 0xFE
+#define SD_TOKEN_STOP_TRAN 0xFD // card may end a stream with this instead of 0xFE
 #define SD_BLOCK_SIZE 512
 // CMD17 - read one 512-byte block
 // Reply: R1, then a variable gap, then token 0xFE, then 512 data bytes,
@@ -422,7 +440,7 @@ static uint8_t sd_read_block_raw(uint32_t block, uint8_t *buf)
     // wait for the start token: card streams 0xFF until the data is ready
     uint64_t start = read_timer();
     token = 0xFF;
-    while ((read_timer() - start) < 100000) // 100 ms worst-case Nac
+    while ((read_timer() - start) < 100000) // 100 ms worst-case Nac : the card's read access time
     {
         token = spi1_transfer(0xFF);
         if (token != 0xFF)
@@ -450,6 +468,7 @@ static uint8_t sd_read_block_raw(uint32_t block, uint8_t *buf)
     return 0;
 }
 
+// updated read block because timer was added to calculate count each tie
 uint8_t sd_read_block(uint32_t block, uint8_t *buf)
 {
     uint64_t t0 = read_timer();
@@ -457,6 +476,106 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
     sd_time_us += (read_timer() - t0);
     sd_read_count++;
     return rc;
+}
+
+// CMD 18 : MULTI-BLOCK READ
+/* CMD 17 grabs one 512 byte block per command. For a file hundred of blocks long that is hundreds of command/response round trips, and each one makes the card pay its internal access latency again.
+   CMD 18 (READ_MULTIPLE_BLOCK) asks once for a run of blocks: the latency is paid a single-time and the blocks then streams back-to-back with no command overhead between them.
+   The run is ended with CMD12 (STOP TRANSMISSION).CS must stay LOW for the entire session - dropping it mid-stream aborts the transfer.
+   Nothing is buffered as a whole: each 512 byte block is pulled into one small staging buffer and handed straight to 'sink', exactly as the CMD17 path does. Memory use is unchanged
+*/
+// CMD12 - Stop transmission. Ends a CMD 18 stream. On entry CS must still be low, the caller owns the CS; this leaves it low.
+//  SPI MODE note: CMD 12 answers with an R1b (R1 + busy ), and the card may still have block data winding out of its shift register when the command lands, so the first non-0xFF byte back is NOT guarranted to be a clean R1. , do not interpret this value.
+//  All we need is that the card saw CMD12 and has gone not-busy before CS rises, so: poll for bit7=0, then clock unitl MISO goes high again (MISO low = card busy).
+static uint8_t sd_stop_transmission(void)
+{
+    uint8_t r1;
+    sd_send_command(12, 0x00000000, SD_DUMMY_CRC); // send the command 12 it has no arguments with dummy crc
+    r1 = sd_read_r1();                             // read reply of the command but ignore its value
+    uint64_t start = read_timer();                 // read the time just to measure the whole transaction time
+    while (read_timer() - start < 100000)          // 100 ms ceiling on the busy wait
+    {
+        if (spi1_transfer(0xFF) != 0x00) // non-0x00 = card released the bus
+        {
+            break;
+        }
+    }
+    return r1;
+}
+
+/* read 'count' consecutive block starting at ' first block ' in one CMD18, every block as it arrives, it is passed to sink(block, 512, ctx) which here right now is the lcdsink or it could be also probe sink to test in uart dump.
+   first_block is a plain block index(SDHC/CCS=1). count must be >=1 . returns 0 on success, 0xFF on any failure.
+   note : it feeds the STEP 1 counters, so the FRAME TIMING report still compares like-for-like against the CMD17 numbers.
+   From the FAT32 read file function count is passed always either 64 i.e. sectors per cluster or <64 i.e. how many blocks/ sectors holds the remaining bytes
+*/
+uint8_t sd_read_multi_block(uint32_t first_block, uint32_t count, sd_block_sink_t sink, void *ctx)
+{
+    static uint8_t blk[SD_BLOCK_SIZE]; // 512 byte buffer
+    uint8_t r1, token;
+
+    if (count == 0) // return if the count is 0 , nothing to read
+    {
+        return 0;
+    }
+
+    uint64_t t0 = read_timer(); // timer to calculate the whole reading and transfer time
+
+    cs_select();                                    // cs goes low for the WHOLE run
+    sd_send_command(18, first_block, SD_DUMMY_CRC); // cmd 18 read multiple block , the first block is the argument here and only needs to be passed once the count and stop transmission stops the reading here, and the dummy crc
+    r1 = sd_read_r1();                              // read the response
+
+    sd_time_us += (read_timer() - t0); // window 1: command + R1 ; stop and read the time , command cost only
+
+    if (r1 != 0x00) // not a valid response ; response is only valid when it is 0x00, all other responses are packed error
+    {
+        cs_deselect(); // cs line high
+        uart0_puts("CMD18 R1 fail\r\n");
+        spi1_transfer(0xFF); // send trailing bits and let it release the bus
+        return 0xFF;         // return failure
+    }
+
+    for (uint32_t b = 0; b < count; b++) // count is whatever passed from the fat32read , either 64 or less than 64 , consecutive read runs cannot read more than a 64 i.e. total sectors per cluster
+    {
+        // one start token before every block - identical to cmd17 path, card streams 0xFF until the data is ready
+        uint64_t start = read_timer(); 
+        token = 0xFF;
+        while ((read_timer() - start) < 100000) // 100 ms worst case nac : the card's read access time
+        {
+            token = spi1_transfer(0xFF);
+            if (token != 0xFF)
+            {
+                break;
+            }
+        }
+        // return if response is anything other than the 0xFF
+        if (token != SD_TOKEN_START_BLOCK) // 0xFE expected valid data start token
+        {
+            // 0xFD = stop token, 0x0X = data error token: either way, abort
+            sd_stop_transmission(); // stop the whole read run using cmd 12 stop transmission
+            cs_deselect();          // cs high
+            spi1_transfer(0xFF);
+            return 0xFF;
+        }
+        // for a valid response start token , read the whole block in the buffer and then send it to the sink
+        for (int i = 0; i < SD_BLOCK_SIZE; i++)
+        {
+            blk[i] = spi1_transfer(0xFF);
+        }
+        spi1_transfer(0xFF);               // CRC16 high - ignored  the crc are the 2 bytes computed on the transfer time by the card's controller , in spi by default crc checking is OFF (cmd59 never enabled)
+        spi1_transfer(0xFF);               // CRC16 low - ignored
+        sd_time_us += (read_timer() - start); // calculate time and stop BEFORE the sink
+        sink(blk, SD_BLOCK_SIZE, ctx);     // hand the block straight on with passed context to it as well without knowing anything what is in it
+        // sink is the trim sink function which then passes to the lcd sink , whole thing passed from the parent read function
+    }
+
+    uint64_t t1 = read_timer();
+    sd_stop_transmission(); // cmd 12 - end the run
+    cs_deselect();          // cs high again
+    spi1_transfer(0xFF);    // trailing bits to release the bus
+
+    sd_time_us += (read_timer() - t1);
+    sd_read_count += count;
+    return 0; // success
 }
 
 // read each block twice and compare all the 512 bytes
